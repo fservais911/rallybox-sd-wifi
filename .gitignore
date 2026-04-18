@@ -1,0 +1,36 @@
+# ESP-IDF build outputs
+build/
+build-*/
+*.map
+*.elf
+*.bin
+*.obj
+*.o
+
+# CMake/Ninja artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+build.ninja
+compile_commands.json
+
+# Flash and generated helper files
+*-flash_args
+flash_args*
+flasher_args.json
+project_description.json
+project_elf_src_*.c
+x509_crt_bundle.S
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# IDE/local settings
+.vscode/settings.json
+
+# OS artifacts
+__MACOSX/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,14 @@
+# Baseline profile for regression testing without RaceBox BLE or GNSS.
+# Use together with sdkconfig.defaults, for example:
+#   idf.py -B build-baseline -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.baseline.defaults" reconfigure build
+
+CONFIG_RALLYBOX_RACEBOX_ENABLED=n
+CONFIG_RALLYBOX_GNSS_ENABLED=n
+
+# Remove hosted Bluetooth when RaceBox is disabled so the build matches the
+# earlier WiFi-plus-storage baseline as closely as possible.
+CONFIG_BT_ENABLED=n
+CONFIG_BT_CONTROLLER_DISABLED=n
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_ESP_HOSTED_ENABLE_BT_BLUEDROID=n
+CONFIG_ESP_HOSTED_BLUEDROID_HCI_VHCI=n

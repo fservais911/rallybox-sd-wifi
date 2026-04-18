@@ -1,0 +1,127 @@
+menu "RallyBox"
+
+    menu "SD Card Settings"
+
+        config RALLYBOX_SD1_CONTROL_GPIO
+            int "SD Card 1 control GPIO"
+            range 0 54
+            default 45
+            help
+                GPIO used to control SD Card 1 mount and unmount state.
+
+        config RALLYBOX_SD2_CONTROL_GPIO
+            int "SD Card 2 control GPIO"
+            range 0 54
+            default 29
+            help
+                GPIO used to control SD Card 2 mount and unmount state.
+
+    endmenu
+
+    menu "WiFi Settings"
+
+        config RALLYBOX_WIFI_MAXIMUM_RETRY
+            int "Maximum WiFi retries"
+            range 1 20
+            default 5
+            help
+                Number of station reconnect attempts before reporting failure.
+
+    endmenu
+
+    menu "RaceBox Settings"
+
+        config RALLYBOX_RACEBOX_ENABLED
+            bool "Enable RaceBox BLE"
+            default y
+            select BT_ENABLED
+            select BT_CONTROLLER_DISABLED
+            select BT_BLUEDROID_ENABLED
+            select ESP_HOSTED_ENABLE_BT_BLUEDROID
+            select ESP_HOSTED_BLUEDROID_HCI_VHCI
+            help
+                Enables the RaceBox BLE client module and the hosted Bluedroid path.
+
+        config RALLYBOX_RACEBOX_TARGET_NAME
+            string "Primary RaceBox device name match"
+            default "RaceBox"
+            depends on RALLYBOX_RACEBOX_ENABLED
+            help
+                Primary case-sensitive substring used to identify RaceBox devices.
+
+        config RALLYBOX_RACEBOX_ALT_TARGET_NAME
+            string "Alternate RaceBox device name match"
+            default "Racebox"
+            depends on RALLYBOX_RACEBOX_ENABLED
+            help
+                Alternate case-sensitive substring used to identify RaceBox devices.
+
+        config RALLYBOX_RACEBOX_SCAN_INTERVAL
+            hex "BLE scan interval"
+            range 0x0004 0x4000
+            default 0x50
+            depends on RALLYBOX_RACEBOX_ENABLED
+            help
+                BLE scan interval passed to esp_ble_gap_set_scan_params().
+
+        config RALLYBOX_RACEBOX_SCAN_WINDOW
+            hex "BLE scan window"
+            range 0x0004 0x4000
+            default 0x30
+            depends on RALLYBOX_RACEBOX_ENABLED
+            help
+                BLE scan window passed to esp_ble_gap_set_scan_params().
+
+        config RALLYBOX_RACEBOX_SCAN_DURATION_SECONDS
+            int "BLE scan duration (seconds)"
+            range 1 60
+            default 10
+            depends on RALLYBOX_RACEBOX_ENABLED
+            help
+                Duration for each BLE scan round before restarting or connecting.
+
+    endmenu
+
+    menu "GNSS Settings"
+
+        config RALLYBOX_GNSS_ENABLED
+            bool "Enable GNSS UART"
+            default y
+            help
+                Enables the GNSS UART reader and NMEA parser task.
+
+        config RALLYBOX_GNSS_UART_PORT
+            int "GNSS UART port"
+            range 0 2
+            default 1
+            depends on RALLYBOX_GNSS_ENABLED
+            help
+                UART controller index used for the external GNSS receiver.
+
+        config RALLYBOX_GNSS_UART_BAUD_RATE
+            int "GNSS UART baud rate"
+            range 9600 921600
+            default 115200
+            depends on RALLYBOX_GNSS_ENABLED
+            help
+                Baud rate used to receive NMEA sentences from the GNSS module.
+
+        config RALLYBOX_GNSS_UART_RX_GPIO
+            int "GNSS UART RX GPIO"
+            range 0 54
+            default 10
+            depends on RALLYBOX_GNSS_ENABLED
+            help
+                GPIO connected to the GNSS module TX output.
+
+        config RALLYBOX_GNSS_UART_TX_GPIO
+            int "GNSS UART TX GPIO"
+            range 0 54
+            default 11
+            depends on RALLYBOX_GNSS_ENABLED
+            help
+                GPIO connected to the GNSS module RX input if outbound commands are used.
+
+    endmenu
+
+endmenu
