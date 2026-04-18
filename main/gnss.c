@@ -382,7 +382,7 @@ static void gnss_task(void* arg)
 
   while (s_gnss_running)
   {
-    int bytes_read = uart_read_bytes(GNSS_UART_PORT, rx_buffer, sizeof(rx_buffer), pdMS_TO_TICKS(250));
+    int bytes_read = uart_read_bytes(GNSS_UART_PORT, rx_buffer, sizeof(rx_buffer), pdMS_TO_TICKS(30));
     if (bytes_read <= 0)
     {
       TickType_t now = xTaskGetTickCount();
@@ -578,10 +578,7 @@ esp_err_t gnss_stop(void)
 
   xSemaphoreGive(s_gnss_lock);
 
-  if (task_to_delete)
-  {
-    vTaskDelete(task_to_delete);
-  }
+  (void)task_to_delete;
 
   s_gnss_state.initialized = false;
   snprintf(s_gnss_state.status_text, sizeof(s_gnss_state.status_text), "%s", "Stopped");

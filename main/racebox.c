@@ -25,11 +25,24 @@ static bool s_racebox_initialized = false;
 static bool s_racebox_connecting = false;
 static bool s_racebox_connected = false;
 static esp_gatt_if_t s_gattc_if = ESP_GATT_IF_NONE;
+static uint16_t s_conn_id = 0xFFFF;
 static esp_bd_addr_t s_peer_bda = { 0 };
 static esp_ble_addr_type_t s_peer_addr_type = BLE_ADDR_TYPE_PUBLIC;
 static int16_t s_last_rssi = 0;
 static char s_device_name[32] = "";
 static bool s_scan_active = false;
+static racebox_rx_callback_t s_rx_callback = NULL;
+static void* s_rx_callback_user_ctx = NULL;
+static uint16_t s_service_start_handle = 0;
+static uint16_t s_service_end_handle = 0;
+static uint16_t s_notify_char_handles[8] = { 0 };
+static size_t s_notify_char_count = 0;
+static const esp_bt_uuid_t notify_descr_uuid = {
+  .len = ESP_UUID_LEN_16,
+  .uuid = {
+    .uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG,
+  },
+};
 
 typedef struct
 {
@@ -349,6 +362,93 @@ static void racebox_update_status(bool connected, int16_t rssi, const char* devi
   system_monitor_set_racebox_status(s_racebox_initialized, connected, rssi, device_name, status_text);
 }
 
+static void racebox_record_notify_char(uint16_t handle)
+{
+  size_t i;
+
+  if (handle == 0)
+  {
+    return;
+  }
+
+  for (i = 0; i < s_notify_char_count; ++i)
+  {
+    if (s_notify_char_handles[i] == handle)
+    {
+      return;
+    }
+  }
+
+  if (s_notify_char_count < (sizeof(s_notify_char_handles) / sizeof(s_notify_char_handles[0])))
+  {
+    s_notify_char_handles[s_notify_char_count++] = handle;
+  }
+}
+
+static void racebox_subscribe_all_notify_chars(esp_gatt_if_t gattc_if, uint16_t conn_id)
+{
+  uint16_t count = 0;
+  esp_err_t err;
+
+  if (s_service_start_handle == 0 || s_service_end_handle == 0 || s_service_start_handle >= s_service_end_handle)
+  {
+    racebox_update_status(true, s_last_rssi, s_device_name, "Connected; no discoverable service range");
+    return;
+  }
+
+  err = esp_ble_gattc_get_attr_count(gattc_if,
+    conn_id,
+    ESP_GATT_DB_CHARACTERISTIC,
+    s_service_start_handle,
+    s_service_end_handle,
+    0,
+    &count);
+  if (err != ESP_OK || count == 0)
+  {
+    racebox_update_status(true, s_last_rssi, s_device_name, "Connected; no characteristics found");
+    return;
+  }
+
+  esp_gattc_char_elem_t* chars = (esp_gattc_char_elem_t*)calloc(count, sizeof(esp_gattc_char_elem_t));
+  if (chars == NULL)
+  {
+    racebox_update_status(true, s_last_rssi, s_device_name, "Connected; characteristic alloc failed");
+    return;
+  }
+
+  err = esp_ble_gattc_get_all_char(gattc_if,
+    conn_id,
+    s_service_start_handle,
+    s_service_end_handle,
+    chars,
+    &count,
+    0);
+  if (err == ESP_OK)
+  {
+    uint16_t i;
+    for (i = 0; i < count; ++i)
+    {
+      if ((chars[i].properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) ||
+        (chars[i].properties & ESP_GATT_CHAR_PROP_BIT_INDICATE))
+      {
+        racebox_record_notify_char(chars[i].char_handle);
+        esp_ble_gattc_register_for_notify(gattc_if, s_peer_bda, chars[i].char_handle);
+      }
+    }
+  }
+
+  free(chars);
+
+  if (s_notify_char_count > 0)
+  {
+    racebox_update_status(true, s_last_rssi, s_device_name, "Connected; subscribed for RaceBox data");
+  }
+  else
+  {
+    racebox_update_status(true, s_last_rssi, s_device_name, "Connected; no notify chars found");
+  }
+}
+
 static void racebox_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param)
 {
   switch (event)
@@ -482,6 +582,11 @@ static void racebox_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
       {
         s_racebox_connected = true;
         s_racebox_connecting = false;
+        s_conn_id = param->open.conn_id;
+        s_service_start_handle = 0;
+        s_service_end_handle = 0;
+        s_notify_char_count = 0;
+        memset(s_notify_char_handles, 0, sizeof(s_notify_char_handles));
         ESP_LOGI(TAG, "Connected to %s conn_id=%u mtu_pending", s_device_name[0] != '\0' ? s_device_name : "<unknown>", param->open.conn_id);
         racebox_update_status(true, s_last_rssi, s_device_name, "Connected to RaceBox");
         esp_ble_gattc_search_service(gattc_if, param->open.conn_id, NULL);
@@ -498,18 +603,80 @@ static void racebox_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
       break;
     case ESP_GATTC_SEARCH_RES_EVT:
       ESP_LOGI(TAG, "Discovered RaceBox service len=%u", param->search_res.srvc_id.uuid.len);
+      if (s_service_start_handle == 0 ||
+        (param->search_res.start_handle < s_service_start_handle))
+      {
+        s_service_start_handle = param->search_res.start_handle;
+      }
+      if (param->search_res.end_handle > s_service_end_handle)
+      {
+        s_service_end_handle = param->search_res.end_handle;
+      }
       break;
     case ESP_GATTC_SEARCH_CMPL_EVT:
       ESP_LOGI(TAG, "Service discovery complete for %s", s_device_name[0] != '\0' ? s_device_name : "<unknown>");
-      racebox_update_status(true, s_last_rssi, s_device_name,
-        "Connected; waiting for RaceBox protocol mapping");
+      racebox_subscribe_all_notify_chars(gattc_if, param->search_cmpl.conn_id);
+      break;
+    case ESP_GATTC_REG_FOR_NOTIFY_EVT:
+      if (param->reg_for_notify.status == ESP_GATT_OK)
+      {
+        uint16_t descr_count = 0;
+        esp_err_t err = esp_ble_gattc_get_attr_count(gattc_if,
+          s_conn_id,
+          ESP_GATT_DB_DESCRIPTOR,
+          s_service_start_handle,
+          s_service_end_handle,
+          param->reg_for_notify.handle,
+          &descr_count);
+
+        if (err == ESP_OK && descr_count > 0)
+        {
+          esp_gattc_descr_elem_t* descrs = (esp_gattc_descr_elem_t*)calloc(descr_count, sizeof(esp_gattc_descr_elem_t));
+          if (descrs)
+          {
+            uint16_t cfg = 0x0001;
+            if (esp_ble_gattc_get_descr_by_char_handle(gattc_if,
+              s_conn_id,
+              param->reg_for_notify.handle,
+              notify_descr_uuid,
+              descrs,
+              &descr_count) == ESP_OK && descr_count > 0)
+            {
+              esp_ble_gattc_write_char_descr(gattc_if,
+                s_conn_id,
+                descrs[0].handle,
+                sizeof(cfg),
+                (uint8_t*)&cfg,
+                ESP_GATT_WRITE_TYPE_RSP,
+                ESP_GATT_AUTH_REQ_NONE);
+            }
+            free(descrs);
+          }
+        }
+      }
+      break;
+    case ESP_GATTC_NOTIFY_EVT:
+      if (s_rx_callback && param->notify.value && param->notify.value_len > 0)
+      {
+        s_rx_callback(param->notify.value, (size_t)param->notify.value_len, s_rx_callback_user_ctx);
+      }
+      break;
+    case ESP_GATTC_READ_CHAR_EVT:
+      if (param->read.status == ESP_GATT_OK && s_rx_callback && param->read.value && param->read.value_len > 0)
+      {
+        s_rx_callback(param->read.value, (size_t)param->read.value_len, s_rx_callback_user_ctx);
+      }
       break;
     case ESP_GATTC_DISCONNECT_EVT:
       s_racebox_connected = false;
       s_racebox_connecting = false;
+      s_conn_id = 0xFFFF;
+      s_service_start_handle = 0;
+      s_service_end_handle = 0;
+      s_notify_char_count = 0;
+      memset(s_notify_char_handles, 0, sizeof(s_notify_char_handles));
       ESP_LOGW(TAG, "RaceBox disconnected, reason=0x%x", param->disconnect.reason);
-      racebox_update_status(false, 0, s_device_name, "RaceBox disconnected; rescanning");
-      racebox_start_scan();
+      racebox_update_status(false, 0, s_device_name, "RaceBox disconnected");
       break;
     default:
       break;
@@ -568,6 +735,28 @@ esp_err_t racebox_request_scan(void)
   racebox_start_scan();
   racebox_update_status(false, 0, s_device_name, "Scanning for BLE devices...");
   return ESP_OK;
+}
+
+esp_err_t racebox_disconnect(void)
+{
+  if (!s_racebox_initialized || s_gattc_if == ESP_GATT_IF_NONE)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (!s_racebox_connected || s_conn_id == 0xFFFF)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  racebox_update_status(false, s_last_rssi, s_device_name, "Disconnecting from RaceBox...");
+  return esp_ble_gattc_close(s_gattc_if, s_conn_id);
+}
+
+void racebox_set_rx_callback(racebox_rx_callback_t cb, void* user_ctx)
+{
+  s_rx_callback = cb;
+  s_rx_callback_user_ctx = user_ctx;
 }
 
 size_t racebox_get_visible_devices(racebox_visible_device_t* out_devices, size_t max_devices)

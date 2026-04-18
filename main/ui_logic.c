@@ -67,10 +67,17 @@
 static const char* TAG = "UI_Logic";   ///< Log tag for this module
 
 #define BLUETOOTH_TAB_INDEX 2
+#define GNSS_TAB_INDEX 3
 #define BLUETOOTH_DROPDOWN_REFRESH_MS 2000
+#define BLUETOOTH_DUMP_PENDING_MAX 4096
+#define BLUETOOTH_DUMP_LINE_MAX 192
 
 #define GNSS_DUMP_PENDING_MAX 4096
 #define GNSS_DUMP_LINE_MAX 192
+#define UART_MONITOR_MAX_CHARS 1600
+#define UART_MONITOR_LINES 20
+#define UART_STREAM_BUFFER_SIZE 8192
+#define UART_STREAM_CHUNK_MAX 384
 
 #define UI_COLOR_BG 0xff0f1419
 #define UI_COLOR_SURFACE 0xff182028
@@ -125,10 +132,48 @@ static void file_modal_close_cb(lv_event_t* e);
 static void file_modal_delete_cb(lv_event_t* e);
 static lv_obj_t* ui_get_first_child(lv_obj_t* obj);
 static void ui_refresh_bluetooth_controls(const system_status_t* status);
+static bool ui_is_bluetooth_tab_active(void);
+static bool ui_is_gnss_tab_active(void);
+static void ui_style_surface(lv_obj_t* obj, lv_color_t bg_color, lv_coord_t radius);
+static void ui_create_main_status_panels(void);
+static void ui_update_main_status_panels(const system_status_t* status);
+static void action_main_panel_racebox_click(lv_event_t* e);
+static void action_main_panel_gnss_click(lv_event_t* e);
 static void action_bluetooth_refresh(lv_event_t* e);
 static void action_bluetooth_connect(lv_event_t* e);
 static void action_gnss_start_stop(lv_event_t* e);
 static void ui_refresh_gnss_dump(void);
+static void ui_refresh_bluetooth_dump(void);
+
+typedef struct
+{
+    SemaphoreHandle_t mutex;
+    char data[UART_STREAM_BUFFER_SIZE];
+    size_t head;
+    size_t tail;
+    bool active;
+    bool overflowed;
+    char partial_line[GNSS_DUMP_LINE_MAX];
+    size_t partial_len;
+} ui_stream_buffer_t;
+
+typedef struct
+{
+    char lines[UART_MONITOR_LINES][GNSS_DUMP_LINE_MAX];
+    uint8_t start;
+    uint8_t count;
+    bool dirty;
+} ui_line_window_t;
+
+static bool ui_stream_init(ui_stream_buffer_t* stream);
+static void ui_stream_start(ui_stream_buffer_t* stream);
+static void ui_stream_stop(ui_stream_buffer_t* stream);
+static void ui_stream_push_bytes(ui_stream_buffer_t* stream, const uint8_t* data, size_t len);
+static size_t ui_stream_pop_chunk(ui_stream_buffer_t* stream, char* out, size_t max_len, bool* had_overflow);
+static void ui_window_reset(ui_line_window_t* window, lv_obj_t* panel);
+static void ui_window_append_line(ui_line_window_t* window, const char* line);
+static void ui_window_consume_chunk(ui_stream_buffer_t* stream, ui_line_window_t* window, const char* chunk, size_t len);
+static void ui_window_render_if_dirty(ui_line_window_t* window, lv_obj_t* panel);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MODERN TEXT DISPLAY COMPONENT
@@ -270,53 +315,359 @@ static racebox_visible_device_t s_bt_visible_devices[RACEBOX_VISIBLE_DEVICES_MAX
 static size_t s_bt_visible_count = 0;
 static uint64_t s_bt_last_dropdown_refresh_us = 0;
 static char s_bt_last_options[1536] = { 0 };
+static ui_stream_buffer_t s_bt_stream = { 0 };
+static ui_line_window_t s_bt_window = { 0 };
+static char s_bt_render_buf[UART_MONITOR_LINES * (BLUETOOTH_DUMP_LINE_MAX + 1)] = { 0 };
+static lv_timer_t* s_bt_dump_timer = NULL;
+static lv_obj_t* s_bt_dump_panel = NULL;
+static bool s_bt_prev_connected = false;
+
+typedef struct
+{
+    bool has_data;
+    bool solution_valid;
+    uint8_t fix_status;
+    uint8_t satellites;
+    float speed_kph;
+    float heading_deg;
+    float pdop;
+    float horizontal_accuracy_m;
+    float vertical_accuracy_m;
+    uint32_t packets;
+} racebox_nav_snapshot_t;
+
+typedef struct
+{
+    SemaphoreHandle_t mutex;
+    uint8_t frame[520];
+    size_t frame_len;
+    racebox_nav_snapshot_t nav;
+} racebox_decode_state_t;
+
+static racebox_decode_state_t s_rb_decode = { 0 };
+
+static bool racebox_decode_ensure_mutex(void);
+static uint16_t racebox_le_u16(const uint8_t* p);
+static uint32_t racebox_le_u32(const uint8_t* p);
+static int32_t racebox_le_i32(const uint8_t* p);
+static void racebox_ubx_checksum(const uint8_t* data, size_t len, uint8_t* ck_a, uint8_t* ck_b);
+static void racebox_decode_nav_payload_locked(const uint8_t* payload, size_t payload_len);
+static void racebox_decode_stream_bytes(const uint8_t* data, size_t len);
+static bool racebox_get_nav_snapshot(racebox_nav_snapshot_t* out);
 #endif
 
-static SemaphoreHandle_t s_gnss_dump_mutex = NULL;
+static ui_stream_buffer_t s_gnss_stream = { 0 };
+static ui_line_window_t s_gnss_window = { 0 };
+static char s_gnss_render_buf[UART_MONITOR_LINES * (GNSS_DUMP_LINE_MAX + 1)] = { 0 };
 static bool s_gnss_listening = false;
+static volatile uint32_t s_gnss_rx_count = 0;
+static volatile uint32_t s_bt_rx_count = 0;
 static char s_gnss_status_text[96] = "Idle. Enter UART settings, then press START";
-static char s_gnss_dump_pending[GNSS_DUMP_PENDING_MAX] = { 0 };
+static lv_timer_t* s_gnss_dump_timer = NULL;
+static uint8_t s_bt_ui_last_connected = 0xFF;
+static uint8_t s_bt_ui_last_initialized = 0xFF;
 
+static lv_obj_t* s_panel_racebox = NULL;
+static lv_obj_t* s_panel_racebox_state = NULL;
+static lv_obj_t* s_panel_racebox_count = NULL;
+static lv_obj_t* s_panel_racebox_detail = NULL;
+static lv_obj_t* s_panel_gnss = NULL;
+static lv_obj_t* s_panel_gnss_state = NULL;
+static lv_obj_t* s_panel_gnss_count = NULL;
+static lv_obj_t* s_panel_gnss_detail = NULL;
+static uint32_t s_last_gnss_count = 0;
+static uint32_t s_last_bt_count = 0;
+static bool s_rb_smooth_valid = false;
+static float s_rb_speed_smooth = 0.0f;
+static float s_rb_heading_smooth = 0.0f;
+static bool s_gnss_smooth_valid = false;
+static float s_gnss_speed_smooth = 0.0f;
+static float s_gnss_heading_smooth = 0.0f;
 
-static bool gnss_dump_ensure_mutex(void)
+static float ui_smooth_scalar(float prev, float current, float alpha)
 {
-    if (s_gnss_dump_mutex == NULL)
-    {
-        s_gnss_dump_mutex = xSemaphoreCreateMutex();
-    }
-    return s_gnss_dump_mutex != NULL;
+    return prev + alpha * (current - prev);
 }
+
+static float ui_smooth_heading(float prev, float current, float alpha)
+{
+    float delta = current - prev;
+
+    if (delta > 180.0f)
+    {
+        delta -= 360.0f;
+    }
+    else if (delta < -180.0f)
+    {
+        delta += 360.0f;
+    }
+
+    prev = prev + alpha * delta;
+    while (prev < 0.0f)
+    {
+        prev += 360.0f;
+    }
+    while (prev >= 360.0f)
+    {
+        prev -= 360.0f;
+    }
+    return prev;
+}
+
+static void gnss_dump_timer_cb(lv_timer_t* t)
+{
+    LV_UNUSED(t);
+    ui_refresh_gnss_dump();
+}
+
+#if CONFIG_RALLYBOX_RACEBOX_ENABLED
+static void bluetooth_dump_timer_cb(lv_timer_t* t)
+{
+    LV_UNUSED(t);
+    ui_refresh_bluetooth_dump();
+}
+
+static bool racebox_decode_ensure_mutex(void)
+{
+    if (s_rb_decode.mutex == NULL)
+    {
+        s_rb_decode.mutex = xSemaphoreCreateMutex();
+    }
+    return s_rb_decode.mutex != NULL;
+}
+
+static uint16_t racebox_le_u16(const uint8_t* p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t racebox_le_u32(const uint8_t* p)
+{
+    return (uint32_t)p[0] |
+        ((uint32_t)p[1] << 8) |
+        ((uint32_t)p[2] << 16) |
+        ((uint32_t)p[3] << 24);
+}
+
+static int32_t racebox_le_i32(const uint8_t* p)
+{
+    return (int32_t)((uint32_t)p[0] |
+        ((uint32_t)p[1] << 8) |
+        ((uint32_t)p[2] << 16) |
+        ((uint32_t)p[3] << 24));
+}
+
+static void racebox_ubx_checksum(const uint8_t* data, size_t len, uint8_t* ck_a, uint8_t* ck_b)
+{
+    size_t i;
+    uint8_t a = 0;
+    uint8_t b = 0;
+
+    for (i = 0; i < len; ++i)
+    {
+        a = (uint8_t)(a + data[i]);
+        b = (uint8_t)(b + a);
+    }
+
+    if (ck_a) *ck_a = a;
+    if (ck_b) *ck_b = b;
+}
+
+static void racebox_decode_nav_payload_locked(const uint8_t* payload, size_t payload_len)
+{
+    uint8_t fix_status;
+    uint8_t fix_flags;
+    uint8_t lat_lon_flags;
+    int32_t speed_mmps;
+    int32_t heading_1e5;
+    uint16_t pdop_1e2;
+    uint32_t h_acc_mm;
+    uint32_t v_acc_mm;
+    float heading;
+
+    if (payload == NULL || payload_len < 80)
+    {
+        return;
+    }
+
+    fix_status = payload[20];
+    fix_flags = payload[21];
+    lat_lon_flags = payload[66];
+    speed_mmps = racebox_le_i32(payload + 48);
+    heading_1e5 = racebox_le_i32(payload + 52);
+    pdop_1e2 = racebox_le_u16(payload + 64);
+    h_acc_mm = racebox_le_u32(payload + 40);
+    v_acc_mm = racebox_le_u32(payload + 44);
+    heading = (float)heading_1e5 / 100000.0f;
+
+    while (heading < 0.0f)
+    {
+        heading += 360.0f;
+    }
+    while (heading >= 360.0f)
+    {
+        heading -= 360.0f;
+    }
+
+    s_rb_decode.nav.has_data = true;
+    s_rb_decode.nav.fix_status = fix_status;
+    s_rb_decode.nav.satellites = payload[23];
+    s_rb_decode.nav.speed_kph = ((float)speed_mmps) * 0.0036f;
+    s_rb_decode.nav.heading_deg = heading;
+    s_rb_decode.nav.pdop = ((float)pdop_1e2) / 100.0f;
+    s_rb_decode.nav.horizontal_accuracy_m = ((float)h_acc_mm) / 1000.0f;
+    s_rb_decode.nav.vertical_accuracy_m = ((float)v_acc_mm) / 1000.0f;
+    s_rb_decode.nav.solution_valid = ((fix_flags & 0x01U) != 0U) &&
+        (fix_status >= 2U) && ((lat_lon_flags & 0x01U) == 0U);
+    s_rb_decode.nav.packets++;
+}
+
+static void racebox_decode_stream_bytes(const uint8_t* data, size_t len)
+{
+    size_t i;
+
+    if (data == NULL || len == 0)
+    {
+        return;
+    }
+
+    if (!racebox_decode_ensure_mutex())
+    {
+        return;
+    }
+
+    if (xSemaphoreTake(s_rb_decode.mutex, pdMS_TO_TICKS(5)) != pdTRUE)
+    {
+        return;
+    }
+
+    for (i = 0; i < len; ++i)
+    {
+        if (s_rb_decode.frame_len >= sizeof(s_rb_decode.frame))
+        {
+            s_rb_decode.frame_len = 0;
+        }
+        s_rb_decode.frame[s_rb_decode.frame_len++] = data[i];
+
+        while (s_rb_decode.frame_len >= 8)
+        {
+            size_t start = 0;
+            uint16_t payload_len;
+            size_t packet_len;
+            uint8_t ck_a;
+            uint8_t ck_b;
+
+            while ((start + 1) < s_rb_decode.frame_len)
+            {
+                if (s_rb_decode.frame[start] == 0xB5 && s_rb_decode.frame[start + 1] == 0x62)
+                {
+                    break;
+                }
+                start++;
+            }
+
+            if (start > 0)
+            {
+                memmove(s_rb_decode.frame,
+                    s_rb_decode.frame + start,
+                    s_rb_decode.frame_len - start);
+                s_rb_decode.frame_len -= start;
+            }
+
+            if (s_rb_decode.frame_len < 8)
+            {
+                break;
+            }
+
+            if (!(s_rb_decode.frame[0] == 0xB5 && s_rb_decode.frame[1] == 0x62))
+            {
+                memmove(s_rb_decode.frame, s_rb_decode.frame + 1, s_rb_decode.frame_len - 1);
+                s_rb_decode.frame_len -= 1;
+                continue;
+            }
+
+            payload_len = racebox_le_u16(s_rb_decode.frame + 4);
+            if (payload_len > 504)
+            {
+                memmove(s_rb_decode.frame, s_rb_decode.frame + 1, s_rb_decode.frame_len - 1);
+                s_rb_decode.frame_len -= 1;
+                continue;
+            }
+
+            packet_len = (size_t)payload_len + 8;
+            if (s_rb_decode.frame_len < packet_len)
+            {
+                break;
+            }
+
+            racebox_ubx_checksum(s_rb_decode.frame + 2, (size_t)payload_len + 4, &ck_a, &ck_b);
+            if (ck_a == s_rb_decode.frame[6 + payload_len] &&
+                ck_b == s_rb_decode.frame[7 + payload_len])
+            {
+                if (s_rb_decode.frame[2] == 0xFF && s_rb_decode.frame[3] == 0x01)
+                {
+                    racebox_decode_nav_payload_locked(s_rb_decode.frame + 6, payload_len);
+                }
+
+                memmove(s_rb_decode.frame,
+                    s_rb_decode.frame + packet_len,
+                    s_rb_decode.frame_len - packet_len);
+                s_rb_decode.frame_len -= packet_len;
+            }
+            else
+            {
+                memmove(s_rb_decode.frame, s_rb_decode.frame + 1, s_rb_decode.frame_len - 1);
+                s_rb_decode.frame_len -= 1;
+            }
+        }
+    }
+
+    xSemaphoreGive(s_rb_decode.mutex);
+}
+
+static bool racebox_get_nav_snapshot(racebox_nav_snapshot_t* out)
+{
+    if (out == NULL)
+    {
+        return false;
+    }
+
+    memset(out, 0, sizeof(*out));
+    if (!racebox_decode_ensure_mutex())
+    {
+        return false;
+    }
+
+    if (xSemaphoreTake(s_rb_decode.mutex, pdMS_TO_TICKS(2)) != pdTRUE)
+    {
+        return false;
+    }
+
+    *out = s_rb_decode.nav;
+    xSemaphoreGive(s_rb_decode.mutex);
+    return out->has_data;
+}
+
+static void racebox_ui_rx_cb(const uint8_t* data, size_t len, void* user_ctx)
+{
+    LV_UNUSED(user_ctx);
+    if (len > 0)
+    {
+        s_bt_rx_count++;
+        racebox_decode_stream_bytes(data, len);
+    }
+    ui_stream_push_bytes(&s_bt_stream, data, len);
+}
+#endif
 
 static void gnss_dump_append_line(const char* line)
 {
-    size_t used;
-    size_t line_len;
-
     if (line == NULL || line[0] == '\0')
     {
         return;
     }
-
-    if (!gnss_dump_ensure_mutex())
-    {
-        return;
-    }
-
-    if (xSemaphoreTake(s_gnss_dump_mutex, pdMS_TO_TICKS(50)) != pdTRUE)
-    {
-        return;
-    }
-
-    used = strlen(s_gnss_dump_pending);
-    line_len = strlen(line);
-    if (used + line_len + 2 >= sizeof(s_gnss_dump_pending))
-    {
-        snprintf(s_gnss_dump_pending, sizeof(s_gnss_dump_pending), "[buffer rollover]\n");
-        used = strlen(s_gnss_dump_pending);
-    }
-
-    snprintf(s_gnss_dump_pending + used, sizeof(s_gnss_dump_pending) - used, "%s\n", line);
-    xSemaphoreGive(s_gnss_dump_mutex);
+    ui_stream_push_bytes(&s_gnss_stream, (const uint8_t*)line, strlen(line));
+    ui_stream_push_bytes(&s_gnss_stream, (const uint8_t*)"\n", 1);
 }
 
 static void gnss_ui_sentence_cb(const char* sentence, void* user_ctx)
@@ -325,8 +676,295 @@ static void gnss_ui_sentence_cb(const char* sentence, void* user_ctx)
 
     if (sentence && sentence[0] != '\0')
     {
+        s_gnss_rx_count++;
         gnss_dump_append_line(sentence);
     }
+}
+
+static void ui_create_main_status_panels(void)
+{
+    lv_obj_t* title;
+
+    if (objects.menu == NULL)
+    {
+        return;
+    }
+
+    if (s_panel_racebox == NULL)
+    {
+        s_panel_racebox = lv_obj_create(objects.menu);
+        lv_obj_set_pos(s_panel_racebox, 430, 452);
+        lv_obj_set_size(s_panel_racebox, 350, 156);
+        ui_style_surface(s_panel_racebox, lv_color_hex(UI_COLOR_SURFACE), 14);
+        lv_obj_set_style_border_color(s_panel_racebox, lv_color_hex(UI_COLOR_BORDER), 0);
+        lv_obj_set_style_border_width(s_panel_racebox, 1, 0);
+        lv_obj_add_flag(s_panel_racebox, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_CLICK_FOCUSABLE);
+        lv_obj_set_style_border_color(s_panel_racebox, lv_color_hex(UI_COLOR_ACCENT), LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(s_panel_racebox, 2, LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(s_panel_racebox, 240, LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_add_event_cb(s_panel_racebox, action_main_panel_racebox_click, LV_EVENT_CLICKED, NULL);
+
+        title = lv_label_create(s_panel_racebox);
+        lv_obj_set_pos(title, 14, 10);
+        lv_label_set_text(title, "RaceBox BLE");
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(title, lv_color_hex(UI_COLOR_TEXT), 0);
+
+        s_panel_racebox_state = lv_label_create(s_panel_racebox);
+        lv_obj_set_pos(s_panel_racebox_state, 14, 52);
+        lv_label_set_text(s_panel_racebox_state, "Status: Disconnected");
+        lv_obj_set_style_text_font(s_panel_racebox_state, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(s_panel_racebox_state, lv_color_hex(UI_COLOR_DANGER), 0);
+
+        s_panel_racebox_count = lv_label_create(s_panel_racebox);
+        lv_obj_set_pos(s_panel_racebox_count, 14, 88);
+        lv_label_set_text(s_panel_racebox_count, "Packets: 0");
+        lv_obj_set_style_text_font(s_panel_racebox_count, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(s_panel_racebox_count, lv_color_hex(UI_COLOR_MUTED), 0);
+
+        s_panel_racebox_detail = lv_label_create(s_panel_racebox);
+        lv_obj_set_pos(s_panel_racebox_detail, 14, 108);
+        lv_obj_set_width(s_panel_racebox_detail, 320);
+        lv_label_set_long_mode(s_panel_racebox_detail, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(s_panel_racebox_detail, "SRC:RB | Device: -- | RSSI: -- dBm");
+        lv_obj_set_style_text_font(s_panel_racebox_detail, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(s_panel_racebox_detail, lv_color_hex(UI_COLOR_MUTED), 0);
+    }
+
+    if (s_panel_gnss == NULL)
+    {
+        s_panel_gnss = lv_obj_create(objects.menu);
+        lv_obj_set_pos(s_panel_gnss, 790, 452);
+        lv_obj_set_size(s_panel_gnss, 350, 156);
+        ui_style_surface(s_panel_gnss, lv_color_hex(UI_COLOR_SURFACE), 14);
+        lv_obj_set_style_border_color(s_panel_gnss, lv_color_hex(UI_COLOR_BORDER), 0);
+        lv_obj_set_style_border_width(s_panel_gnss, 1, 0);
+        lv_obj_add_flag(s_panel_gnss, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_CLICK_FOCUSABLE);
+        lv_obj_set_style_border_color(s_panel_gnss, lv_color_hex(UI_COLOR_ACCENT), LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(s_panel_gnss, 2, LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(s_panel_gnss, 240, LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_add_event_cb(s_panel_gnss, action_main_panel_gnss_click, LV_EVENT_CLICKED, NULL);
+
+        title = lv_label_create(s_panel_gnss);
+        lv_obj_set_pos(title, 14, 10);
+        lv_label_set_text(title, "GNSS");
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(title, lv_color_hex(UI_COLOR_TEXT), 0);
+
+        s_panel_gnss_state = lv_label_create(s_panel_gnss);
+        lv_obj_set_pos(s_panel_gnss_state, 14, 52);
+        lv_label_set_text(s_panel_gnss_state, "Status: Disconnected");
+        lv_obj_set_style_text_font(s_panel_gnss_state, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(s_panel_gnss_state, lv_color_hex(UI_COLOR_DANGER), 0);
+
+        s_panel_gnss_count = lv_label_create(s_panel_gnss);
+        lv_obj_set_pos(s_panel_gnss_count, 14, 88);
+        lv_label_set_text(s_panel_gnss_count, "Sentences: 0");
+        lv_obj_set_style_text_font(s_panel_gnss_count, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(s_panel_gnss_count, lv_color_hex(UI_COLOR_MUTED), 0);
+
+        s_panel_gnss_detail = lv_label_create(s_panel_gnss);
+        lv_obj_set_pos(s_panel_gnss_detail, 14, 108);
+        lv_obj_set_width(s_panel_gnss_detail, 320);
+        lv_label_set_long_mode(s_panel_gnss_detail, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(s_panel_gnss_detail, "SRC:UART | Fix: -- | Sats: -- | Speed: --");
+        lv_obj_set_style_text_font(s_panel_gnss_detail, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(s_panel_gnss_detail, lv_color_hex(UI_COLOR_MUTED), 0);
+    }
+}
+
+static void action_main_panel_racebox_click(lv_event_t* e)
+{
+    action_bluetooth_connect(e);
+}
+
+static void action_main_panel_gnss_click(lv_event_t* e)
+{
+    action_gnss_start_stop(e);
+}
+
+static void ui_update_main_status_panels(const system_status_t* status)
+{
+    char line[160];
+    char detail[192];
+    uint32_t gnss_count;
+    uint32_t bt_count;
+    bool gnss_receiving;
+    bool bt_receiving;
+    bool moving;
+    float speed_kph;
+    float heading_deg;
+#if CONFIG_RALLYBOX_RACEBOX_ENABLED
+    racebox_nav_snapshot_t rb_nav = { 0 };
+    bool rb_has_data = racebox_get_nav_snapshot(&rb_nav);
+#endif
+
+    if (status == NULL)
+    {
+        return;
+    }
+
+    if (s_panel_racebox == NULL || s_panel_gnss == NULL)
+    {
+        ui_create_main_status_panels();
+    }
+
+    if (s_panel_racebox_state == NULL || s_panel_racebox_count == NULL ||
+        s_panel_gnss_state == NULL || s_panel_gnss_count == NULL ||
+        s_panel_racebox_detail == NULL || s_panel_gnss_detail == NULL)
+    {
+        return;
+    }
+
+    gnss_count = s_gnss_rx_count;
+    bt_count = s_bt_rx_count;
+    gnss_receiving = s_gnss_listening && (gnss_count != s_last_gnss_count);
+    bt_receiving = status->racebox_connected && (bt_count != s_last_bt_count);
+
+    if (status->racebox_connected)
+    {
+        snprintf(line, sizeof(line), "Status: %s",
+            bt_receiving ? "Connected / Receiving" : "Connected / Idle");
+        lv_label_set_text(s_panel_racebox_state, line);
+        lv_obj_set_style_text_color(s_panel_racebox_state,
+            bt_receiving ? lv_color_hex(UI_COLOR_SUCCESS) : lv_color_hex(UI_COLOR_WARNING), 0);
+    }
+    else
+    {
+        lv_label_set_text(s_panel_racebox_state, "Status: Disconnected");
+        lv_obj_set_style_text_color(s_panel_racebox_state, lv_color_hex(UI_COLOR_DANGER), 0);
+    }
+
+    snprintf(line, sizeof(line), "Packets: %lu", (unsigned long)bt_count);
+    lv_label_set_text(s_panel_racebox_count, line);
+
+    #if CONFIG_RALLYBOX_RACEBOX_ENABLED
+    if (status->racebox_connected && rb_has_data)
+    {
+        const char* fix_text = "none";
+            speed_kph = rb_nav.speed_kph;
+            heading_deg = rb_nav.heading_deg;
+        if (speed_kph < 0.0f)
+        {
+            speed_kph = -speed_kph;
+        }
+
+        if (rb_nav.fix_status == 3)
+        {
+            fix_text = "3D";
+        }
+        else if (rb_nav.fix_status == 2)
+        {
+            fix_text = "2D";
+        }
+
+        if (!s_rb_smooth_valid)
+        {
+            s_rb_speed_smooth = speed_kph;
+            s_rb_heading_smooth = heading_deg;
+            s_rb_smooth_valid = true;
+        }
+        else
+        {
+            s_rb_speed_smooth = ui_smooth_scalar(s_rb_speed_smooth, speed_kph, 0.25f);
+            s_rb_heading_smooth = ui_smooth_heading(s_rb_heading_smooth, heading_deg, 0.25f);
+        }
+
+        snprintf(detail, sizeof(detail),
+            "SRC:RB | Fix:%s | S:%u | %.1f km/h | %.0f deg | %s\nPDOP:%.2f | hAcc:%.1fm | vAcc:%.1fm",
+            rb_nav.solution_valid ? fix_text : "none",
+            (unsigned)rb_nav.satellites,
+            (double)s_rb_speed_smooth,
+            (double)s_rb_heading_smooth,
+            s_rb_speed_smooth > 2.0f ? "Moving" : "Still",
+            (double)rb_nav.pdop,
+            (double)rb_nav.horizontal_accuracy_m,
+            (double)rb_nav.vertical_accuracy_m);
+    }
+    else
+    {
+        s_rb_smooth_valid = false;
+        snprintf(detail, sizeof(detail), "SRC:RB | Device: %s | RSSI: %d dBm",
+            status->racebox_device_name[0] ? status->racebox_device_name : "--",
+            (int)status->racebox_rssi);
+    }
+    #else
+    snprintf(detail, sizeof(detail), "SRC:RB | Device: %s | RSSI: %d dBm",
+        status->racebox_device_name[0] ? status->racebox_device_name : "--",
+        (int)status->racebox_rssi);
+    #endif
+    lv_label_set_text(s_panel_racebox_detail, detail);
+
+    if (s_gnss_listening)
+    {
+        snprintf(line, sizeof(line), "Status: %s",
+            gnss_receiving ? "Connected / Receiving" : "Connected / Idle");
+        lv_label_set_text(s_panel_gnss_state, line);
+        lv_obj_set_style_text_color(s_panel_gnss_state,
+            gnss_receiving ? lv_color_hex(UI_COLOR_SUCCESS) : lv_color_hex(UI_COLOR_WARNING), 0);
+    }
+    else
+    {
+        lv_label_set_text(s_panel_gnss_state, "Status: Disconnected");
+        lv_obj_set_style_text_color(s_panel_gnss_state, lv_color_hex(UI_COLOR_DANGER), 0);
+    }
+
+    snprintf(line, sizeof(line), "Sentences: %lu", (unsigned long)gnss_count);
+    lv_label_set_text(s_panel_gnss_count, line);
+
+    speed_kph = status->gnss_speed_kph;
+    if (speed_kph < 0.0f)
+    {
+        speed_kph = -speed_kph;
+    }
+    heading_deg = status->gnss_heading_deg;
+    while (heading_deg < 0.0f)
+    {
+        heading_deg += 360.0f;
+    }
+    while (heading_deg >= 360.0f)
+    {
+        heading_deg -= 360.0f;
+    }
+
+    if (status->gnss_fix_valid)
+    {
+        if (!s_gnss_smooth_valid)
+        {
+            s_gnss_speed_smooth = speed_kph;
+            s_gnss_heading_smooth = heading_deg;
+            s_gnss_smooth_valid = true;
+        }
+        else
+        {
+            s_gnss_speed_smooth = ui_smooth_scalar(s_gnss_speed_smooth, speed_kph, 0.25f);
+            s_gnss_heading_smooth = ui_smooth_heading(s_gnss_heading_smooth, heading_deg, 0.25f);
+        }
+    }
+    else
+    {
+        s_gnss_smooth_valid = false;
+    }
+
+    moving = s_gnss_speed_smooth > 2.0f;
+    if (status->gnss_fix_valid)
+    {
+        snprintf(detail, sizeof(detail), "SRC:UART | Fix:%u | S:%u | %.1f km/h\nHead:%.0f deg | %s",
+            (unsigned)status->gnss_fix_quality,
+            (unsigned)status->gnss_satellites,
+            (double)s_gnss_speed_smooth,
+            (double)s_gnss_heading_smooth,
+            moving ? "Moving" : "Still");
+    }
+    else
+    {
+        snprintf(detail, sizeof(detail), "SRC:UART | Fix:none | S:%u\nWaiting for lock",
+            (unsigned)status->gnss_satellites);
+    }
+    lv_label_set_text(s_panel_gnss_detail, detail);
+
+    s_last_gnss_count = gnss_count;
+    s_last_bt_count = bt_count;
 }
 
 static esp_err_t gnss_monitor_start(int baud_rate, int tx_gpio, int rx_gpio)
@@ -355,30 +993,333 @@ static void gnss_monitor_stop(void)
 #endif
 }
 
+static bool ui_stream_init(ui_stream_buffer_t* stream)
+{
+    if (stream == NULL)
+    {
+        return false;
+    }
+
+    if (stream->mutex == NULL)
+    {
+        stream->mutex = xSemaphoreCreateMutex();
+    }
+
+    return stream->mutex != NULL;
+}
+
+static void ui_stream_start(ui_stream_buffer_t* stream)
+{
+    if (!ui_stream_init(stream))
+    {
+        return;
+    }
+
+    if (xSemaphoreTake(stream->mutex, pdMS_TO_TICKS(20)) == pdTRUE)
+    {
+        stream->head = 0;
+        stream->tail = 0;
+        stream->partial_len = 0;
+        stream->overflowed = false;
+        stream->active = true;
+        xSemaphoreGive(stream->mutex);
+    }
+}
+
+static void ui_stream_stop(ui_stream_buffer_t* stream)
+{
+    if (!ui_stream_init(stream))
+    {
+        return;
+    }
+
+    if (xSemaphoreTake(stream->mutex, pdMS_TO_TICKS(20)) == pdTRUE)
+    {
+        stream->active = false;
+        stream->head = 0;
+        stream->tail = 0;
+        stream->partial_len = 0;
+        stream->overflowed = false;
+        xSemaphoreGive(stream->mutex);
+    }
+}
+
+static void ui_stream_push_bytes(ui_stream_buffer_t* stream, const uint8_t* data, size_t len)
+{
+    size_t i;
+    size_t next_head;
+
+    if (stream == NULL || data == NULL || len == 0)
+    {
+        return;
+    }
+
+    if (!ui_stream_init(stream))
+    {
+        return;
+    }
+
+    if (xSemaphoreTake(stream->mutex, pdMS_TO_TICKS(5)) != pdTRUE)
+    {
+        return;
+    }
+
+    if (!stream->active)
+    {
+        xSemaphoreGive(stream->mutex);
+        return;
+    }
+
+    for (i = 0; i < len; ++i)
+    {
+        next_head = (stream->head + 1) % sizeof(stream->data);
+        if (next_head == stream->tail)
+        {
+            stream->tail = 0;
+            stream->head = 0;
+            stream->partial_len = 0;
+            stream->overflowed = true;
+            next_head = 1;
+        }
+
+        stream->data[stream->head] = (char)data[i];
+        stream->head = next_head;
+    }
+
+    xSemaphoreGive(stream->mutex);
+}
+
+static size_t ui_stream_pop_chunk(ui_stream_buffer_t* stream, char* out, size_t max_len, bool* had_overflow)
+{
+    size_t copied = 0;
+
+    if (stream == NULL || out == NULL || max_len == 0)
+    {
+        return 0;
+    }
+
+    if (had_overflow)
+    {
+        *had_overflow = false;
+    }
+
+    if (!ui_stream_init(stream))
+    {
+        return 0;
+    }
+
+    if (xSemaphoreTake(stream->mutex, pdMS_TO_TICKS(5)) != pdTRUE)
+    {
+        return 0;
+    }
+
+    if (had_overflow && stream->overflowed)
+    {
+        *had_overflow = true;
+        stream->overflowed = false;
+    }
+
+    while (stream->tail != stream->head && copied < max_len)
+    {
+        out[copied++] = stream->data[stream->tail];
+        stream->tail = (stream->tail + 1) % sizeof(stream->data);
+    }
+
+    xSemaphoreGive(stream->mutex);
+    return copied;
+}
+
+static void ui_window_reset(ui_line_window_t* window, lv_obj_t* panel)
+{
+    if (window == NULL)
+    {
+        return;
+    }
+
+    window->start = 0;
+    window->count = 0;
+    window->dirty = true;
+
+    if (panel)
+    {
+        lv_textarea_set_text(panel, "");
+    }
+}
+
+static void ui_window_append_line(ui_line_window_t* window, const char* line)
+{
+    uint8_t slot;
+
+    if (window == NULL || line == NULL || line[0] == '\0')
+    {
+        return;
+    }
+
+    if (window->count < UART_MONITOR_LINES)
+    {
+        slot = (uint8_t)((window->start + window->count) % UART_MONITOR_LINES);
+        window->count++;
+    }
+    else
+    {
+        slot = window->start;
+        window->start = (uint8_t)((window->start + 1) % UART_MONITOR_LINES);
+    }
+
+    snprintf(window->lines[slot], sizeof(window->lines[slot]), "%s", line);
+    window->dirty = true;
+}
+
+static void ui_window_consume_chunk(ui_stream_buffer_t* stream, ui_line_window_t* window, const char* chunk, size_t len)
+{
+    size_t i;
+
+    if (stream == NULL || window == NULL || chunk == NULL || len == 0)
+    {
+        return;
+    }
+
+    for (i = 0; i < len; ++i)
+    {
+        char ch = chunk[i];
+
+        if (ch == '\r')
+        {
+            continue;
+        }
+
+        if (ch == '\n')
+        {
+            if (stream->partial_len > 0)
+            {
+                stream->partial_line[stream->partial_len] = '\0';
+                ui_window_append_line(window, stream->partial_line);
+                stream->partial_len = 0;
+            }
+            continue;
+        }
+
+        if (!(isprint((unsigned char)ch) || ch == '\t' || ch == ' '))
+        {
+            continue;
+        }
+
+        if (stream->partial_len < (sizeof(stream->partial_line) - 1))
+        {
+            stream->partial_line[stream->partial_len++] = ch;
+        }
+    }
+}
+
+static void ui_window_render_if_dirty(ui_line_window_t* window, lv_obj_t* panel)
+{
+    uint8_t i;
+    size_t offset = 0;
+
+    if (window == NULL || panel == NULL || !window->dirty)
+    {
+        return;
+    }
+
+    if (panel == objects.gnss_dump_panel)
+    {
+        s_gnss_render_buf[0] = '\0';
+        for (i = 0; i < window->count; ++i)
+        {
+            uint8_t idx = (uint8_t)((window->start + i) % UART_MONITOR_LINES);
+            int wrote = snprintf(s_gnss_render_buf + offset,
+                sizeof(s_gnss_render_buf) - offset,
+                "%s%s",
+                window->lines[idx],
+                (i + 1 < window->count) ? "\n" : "");
+            if (wrote <= 0 || (size_t)wrote >= (sizeof(s_gnss_render_buf) - offset))
+            {
+                break;
+            }
+            offset += (size_t)wrote;
+        }
+        lv_textarea_set_text(panel, s_gnss_render_buf);
+    }
+#if CONFIG_RALLYBOX_RACEBOX_ENABLED
+    else if (panel == s_bt_dump_panel)
+    {
+        s_bt_render_buf[0] = '\0';
+        for (i = 0; i < window->count; ++i)
+        {
+            uint8_t idx = (uint8_t)((window->start + i) % UART_MONITOR_LINES);
+            int wrote = snprintf(s_bt_render_buf + offset,
+                sizeof(s_bt_render_buf) - offset,
+                "%s%s",
+                window->lines[idx],
+                (i + 1 < window->count) ? "\n" : "");
+            if (wrote <= 0 || (size_t)wrote >= (sizeof(s_bt_render_buf) - offset))
+            {
+                break;
+            }
+            offset += (size_t)wrote;
+        }
+        lv_textarea_set_text(panel, s_bt_render_buf);
+    }
+#endif
+
+    lv_textarea_set_cursor_pos(panel, LV_TEXTAREA_CURSOR_LAST);
+    window->dirty = false;
+}
+
 static void ui_refresh_gnss_dump(void)
 {
-    if (objects.gnss_dump_panel == NULL)
+    if (!ui_is_gnss_tab_active())
     {
         return;
     }
 
-    if (!gnss_dump_ensure_mutex())
+    char chunk[UART_STREAM_CHUNK_MAX];
+    bool had_overflow = false;
+    size_t n;
+
+    n = ui_stream_pop_chunk(&s_gnss_stream, chunk, sizeof(chunk), &had_overflow);
+    if (had_overflow)
+    {
+        ui_window_append_line(&s_gnss_window, "[buffer rollover]");
+    }
+    if (n > 0)
+    {
+        ui_window_consume_chunk(&s_gnss_stream, &s_gnss_window, chunk, n);
+    }
+
+    if (objects.gnss_dump_panel)
+    {
+        ui_window_render_if_dirty(&s_gnss_window, objects.gnss_dump_panel);
+    }
+}
+
+static void ui_refresh_bluetooth_dump(void)
+{
+#if CONFIG_RALLYBOX_RACEBOX_ENABLED
+    if (!ui_is_bluetooth_tab_active())
     {
         return;
     }
 
-    if (xSemaphoreTake(s_gnss_dump_mutex, pdMS_TO_TICKS(5)) != pdTRUE)
+    char chunk[UART_STREAM_CHUNK_MAX];
+    bool had_overflow = false;
+    size_t n;
+
+    n = ui_stream_pop_chunk(&s_bt_stream, chunk, sizeof(chunk), &had_overflow);
+    if (had_overflow)
     {
-        return;
+        ui_window_append_line(&s_bt_window, "[buffer rollover]");
+    }
+    if (n > 0)
+    {
+        ui_window_consume_chunk(&s_bt_stream, &s_bt_window, chunk, n);
     }
 
-    if (s_gnss_dump_pending[0] != '\0')
+    if (s_bt_dump_panel)
     {
-        lv_textarea_add_text(objects.gnss_dump_panel, s_gnss_dump_pending);
-        s_gnss_dump_pending[0] = '\0';
+        ui_window_render_if_dirty(&s_bt_window, s_bt_dump_panel);
     }
-
-    xSemaphoreGive(s_gnss_dump_mutex);
+#endif
 }
 
 static void action_gnss_start_stop(lv_event_t* e)
@@ -387,20 +1328,25 @@ static void action_gnss_start_stop(lv_event_t* e)
     int tx_gpio;
     int rx_gpio;
     lv_obj_t* label;
+    char line[96];
 
     LV_UNUSED(e);
 
     if (s_gnss_listening)
     {
-        gnss_monitor_stop();
-        s_gnss_listening = false;
-        snprintf(s_gnss_status_text, sizeof(s_gnss_status_text), "Stopped. Press START to listen again");
-        if (objects.gnss_status_label) lv_label_set_text(objects.gnss_status_label, s_gnss_status_text);
         if (objects.gnss_start_stop_button)
         {
             label = ui_get_first_child(objects.gnss_start_stop_button);
             if (label) lv_label_set_text(label, "START");
         }
+
+        gnss_monitor_stop();
+        s_gnss_listening = false;
+        gnss_dump_append_line("Stopped by user");
+        ui_refresh_gnss_dump();
+        ui_stream_stop(&s_gnss_stream);
+        snprintf(s_gnss_status_text, sizeof(s_gnss_status_text), "Stopped. Press START to listen again");
+        if (objects.gnss_status_label) lv_label_set_text(objects.gnss_status_label, s_gnss_status_text);
         return;
     }
 
@@ -425,37 +1371,42 @@ static void action_gnss_start_stop(lv_event_t* e)
         return;
     }
 
-    if (objects.gnss_dump_panel)
-    {
-        lv_textarea_set_text(objects.gnss_dump_panel, "");
-    }
-    if (gnss_dump_ensure_mutex())
-    {
-        if (xSemaphoreTake(s_gnss_dump_mutex, pdMS_TO_TICKS(20)) == pdTRUE)
-        {
-            s_gnss_dump_pending[0] = '\0';
-            xSemaphoreGive(s_gnss_dump_mutex);
-        }
-    }
-
-    esp_err_t ret = gnss_monitor_start(baud_rate, tx_gpio, rx_gpio);
-    if (ret != ESP_OK)
-    {
-        ui_handle_error("Failed to start GNSS listener", ret);
-        return;
-    }
-
-    s_gnss_listening = true;
-
-    snprintf(s_gnss_status_text, sizeof(s_gnss_status_text),
-        "Listening @ %d baud (TX=%d RX=%d)",
-        baud_rate, tx_gpio, rx_gpio);
-    if (objects.gnss_status_label) lv_label_set_text(objects.gnss_status_label, s_gnss_status_text);
     if (objects.gnss_start_stop_button)
     {
         label = ui_get_first_child(objects.gnss_start_stop_button);
         if (label) lv_label_set_text(label, "STOP");
     }
+
+    if (objects.gnss_dump_panel)
+    {
+        ui_window_reset(&s_gnss_window, objects.gnss_dump_panel);
+    }
+    s_gnss_rx_count = 0;
+    s_last_gnss_count = 0;
+    ui_stream_start(&s_gnss_stream);
+
+    esp_err_t ret = gnss_monitor_start(baud_rate, tx_gpio, rx_gpio);
+    if (ret != ESP_OK)
+    {
+        ui_stream_stop(&s_gnss_stream);
+        if (objects.gnss_start_stop_button)
+        {
+            label = ui_get_first_child(objects.gnss_start_stop_button);
+            if (label) lv_label_set_text(label, "START");
+        }
+        ui_handle_error("Failed to start GNSS listener", ret);
+        return;
+    }
+
+    s_gnss_listening = true;
+    snprintf(line, sizeof(line), "Started by user: Baud=%d TX=%d RX=%d", baud_rate, tx_gpio, rx_gpio);
+    gnss_dump_append_line(line);
+    ui_refresh_gnss_dump();
+
+    snprintf(s_gnss_status_text, sizeof(s_gnss_status_text),
+        "Listening @ %d baud (TX=%d RX=%d)",
+        baud_rate, tx_gpio, rx_gpio);
+    if (objects.gnss_status_label) lv_label_set_text(objects.gnss_status_label, s_gnss_status_text);
 }
 
 // Forward declarations for hardware functions (to be linked from main/sd_card.c, etc.)
@@ -1490,6 +2441,16 @@ static bool ui_is_bluetooth_tab_active(void)
     return lv_tabview_get_tab_active(objects.obj0) == BLUETOOTH_TAB_INDEX;
 }
 
+static bool ui_is_gnss_tab_active(void)
+{
+    if (objects.obj0 == NULL)
+    {
+        return false;
+    }
+
+    return lv_tabview_get_tab_active(objects.obj0) == GNSS_TAB_INDEX;
+}
+
 static void ui_refresh_bluetooth_dropdown(bool force)
 {
 #if CONFIG_RALLYBOX_RACEBOX_ENABLED
@@ -1587,18 +2548,61 @@ static void ui_refresh_bluetooth_controls(const system_status_t* status)
             (int)status->racebox_rssi,
             status->racebox_status_text[0] ? status->racebox_status_text : "Connected");
         lv_obj_set_style_text_color(objects.bluetooth_status_label, lv_color_hex(UI_COLOR_SUCCESS), 0);
+        if (objects.bluetooth_connect_button)
+        {
+            ui_set_wifi_button_style(objects.bluetooth_connect_button,
+                lv_color_hex(0xffd84343),
+                lv_color_hex(0xff8b0000),
+                "DISCONNECT");
+        }
     }
     else if (status->racebox_initialized)
     {
         snprintf(text, sizeof(text), "%s",
             status->racebox_status_text[0] ? status->racebox_status_text : "Scanning for BLE devices");
         lv_obj_set_style_text_color(objects.bluetooth_status_label, lv_color_hex(UI_COLOR_WARNING), 0);
+        if (objects.bluetooth_connect_button)
+        {
+            ui_set_wifi_button_style(objects.bluetooth_connect_button,
+                lv_color_hex(0xff00acc1),
+                lv_color_hex(0xff1565c0),
+                "CONNECT");
+        }
     }
     else
     {
         snprintf(text, sizeof(text), "RaceBox BLE not initialized");
         lv_obj_set_style_text_color(objects.bluetooth_status_label, lv_color_hex(UI_COLOR_DANGER), 0);
+        if (objects.bluetooth_connect_button)
+        {
+            ui_set_wifi_button_style(objects.bluetooth_connect_button,
+                lv_color_hex(0xff00acc1),
+                lv_color_hex(0xff1565c0),
+                "CONNECT");
+        }
     }
+
+    if (status->racebox_connected && !s_bt_prev_connected)
+    {
+        char line[160];
+        ui_stream_start(&s_bt_stream);
+        s_bt_rx_count = 0;
+        s_last_bt_count = 0;
+        snprintf(line, sizeof(line), "Connected: %s | RSSI=%d dBm | %s",
+            status->racebox_device_name[0] ? status->racebox_device_name : "RaceBox",
+            (int)status->racebox_rssi,
+            status->racebox_status_text[0] ? status->racebox_status_text : "Connected");
+        ui_window_append_line(&s_bt_window, line);
+    }
+    else if (!status->racebox_connected && s_bt_prev_connected)
+    {
+        char line[160];
+        snprintf(line, sizeof(line), "Disconnected: %s",
+            status->racebox_status_text[0] ? status->racebox_status_text : "RaceBox disconnected");
+        ui_window_append_line(&s_bt_window, line);
+        ui_stream_stop(&s_bt_stream);
+    }
+    s_bt_prev_connected = status->racebox_connected;
 
     lv_label_set_text(objects.bluetooth_status_label, text);
     ui_refresh_bluetooth_dropdown(false);
@@ -1651,8 +2655,24 @@ static void action_bluetooth_connect(lv_event_t* e)
     LV_UNUSED(e);
 
 #if CONFIG_RALLYBOX_RACEBOX_ENABLED
+    system_status_t status = system_monitor_get_status();
     uint32_t selected_index;
     esp_err_t ret;
+
+    if (status.racebox_connected)
+    {
+        ret = racebox_disconnect();
+        if (ret != ESP_OK)
+        {
+            ui_handle_error("Failed to disconnect BLE device", ret);
+            return;
+        }
+
+        ui_window_append_line(&s_bt_window, "Disconnect requested by user");
+        ui_refresh_bluetooth_dump();
+        ui_show_message("Bluetooth", "Disconnecting from RaceBox...", lv_color_hex(UI_COLOR_SURFACE));
+        return;
+    }
 
     if (objects.bluetooth_device_dropdown == NULL)
     {
@@ -1678,6 +2698,23 @@ static void action_bluetooth_connect(lv_event_t* e)
         ui_handle_error("Failed to start BLE connection", ret);
         return;
     }
+
+    ui_stream_start(&s_bt_stream);
+    s_bt_rx_count = 0;
+    s_last_bt_count = 0;
+    if (s_bt_dump_panel)
+    {
+        ui_window_reset(&s_bt_window, s_bt_dump_panel);
+    }
+
+    {
+        char line[160];
+        snprintf(line, sizeof(line), "Connect requested: %s | RSSI=%d dBm",
+            s_bt_visible_devices[selected_index].name,
+            (int)s_bt_visible_devices[selected_index].rssi);
+        ui_window_append_line(&s_bt_window, line);
+    }
+    ui_refresh_bluetooth_dump();
 
     ui_show_message("Bluetooth", "Connecting to selected BLE device...", lv_color_hex(UI_COLOR_SURFACE));
 #else
@@ -1837,14 +2874,26 @@ void ui_logic_update_wifi_live(const system_status_t* status)
 #endif
 
     ui_refresh_wifi_controls(status);
-    ui_refresh_bluetooth_controls(status);
-    ui_refresh_gnss_dump();
+    if (status)
+    {
+        bool bt_tab_active = ui_is_bluetooth_tab_active();
+        bool bt_state_changed = (status->racebox_connected != s_bt_ui_last_connected) ||
+            (status->racebox_initialized != s_bt_ui_last_initialized);
 
-    if (objects.gnss_status_label)
+        if (bt_tab_active || bt_state_changed)
+        {
+            ui_refresh_bluetooth_controls(status);
+            s_bt_ui_last_connected = status->racebox_connected;
+            s_bt_ui_last_initialized = status->racebox_initialized;
+        }
+    }
+    ui_update_main_status_panels(status);
+
+    if (ui_is_gnss_tab_active() && objects.gnss_status_label)
     {
         lv_label_set_text(objects.gnss_status_label, s_gnss_status_text);
     }
-    if (objects.gnss_start_stop_button)
+    if (ui_is_gnss_tab_active() && objects.gnss_start_stop_button)
     {
         lv_obj_t* label = ui_get_first_child(objects.gnss_start_stop_button);
         if (label)
@@ -2903,11 +3952,40 @@ void ui_logic_init_events(void)
         lv_obj_set_style_bg_opa(objects.menu, LV_OPA_COVER, 0);
     }
 
+    ui_create_main_status_panels();
+
     if (objects.ui_keyboard_1)
     {
         lv_obj_add_event_cb(objects.ui_keyboard_1, action_password_ssid_keyboad, LV_EVENT_ALL, NULL);
         ui_style_keyboard(objects.ui_keyboard_1);
     }
+
+    if (s_gnss_dump_timer == NULL)
+    {
+        /* Keep monitor refresh light to preserve touch responsiveness. */
+        s_gnss_dump_timer = lv_timer_create(gnss_dump_timer_cb, 120, NULL);
+        if (s_gnss_dump_timer)
+        {
+            lv_timer_set_repeat_count(s_gnss_dump_timer, -1);
+        }
+    }
+    ui_stream_init(&s_gnss_stream);
+    ui_stream_stop(&s_gnss_stream);
+    ui_window_reset(&s_gnss_window, objects.gnss_dump_panel);
+
+#if CONFIG_RALLYBOX_RACEBOX_ENABLED
+    if (s_bt_dump_timer == NULL)
+    {
+        s_bt_dump_timer = lv_timer_create(bluetooth_dump_timer_cb, 120, NULL);
+        if (s_bt_dump_timer)
+        {
+            lv_timer_set_repeat_count(s_bt_dump_timer, -1);
+        }
+    }
+    ui_stream_init(&s_bt_stream);
+    ui_stream_stop(&s_bt_stream);
+    racebox_set_rx_callback(racebox_ui_rx_cb, NULL);
+#endif
 
     if (objects.input_box_1)
     {
@@ -2949,6 +4027,26 @@ void ui_logic_init_events(void)
         style_modern_button(objects.bluetooth_connect_button, lv_color_hex(0xff00acc1), lv_color_hex(0xff1565c0));
         lv_obj_add_event_cb(objects.bluetooth_connect_button, action_bluetooth_connect, LV_EVENT_CLICKED, NULL);
     }
+
+#if CONFIG_RALLYBOX_RACEBOX_ENABLED
+    if (objects.bluetooth_page)
+    {
+        if (s_bt_dump_panel == NULL)
+        {
+            s_bt_dump_panel = lv_textarea_create(objects.bluetooth_page);
+            lv_obj_set_pos(s_bt_dump_panel, 12, 240);
+            lv_obj_set_size(s_bt_dump_panel, 1132, 446);
+            lv_textarea_set_one_line(s_bt_dump_panel, false);
+            lv_textarea_set_max_length(s_bt_dump_panel, 16384);
+            lv_textarea_set_placeholder_text(s_bt_dump_panel, "RaceBox BLE messages (NMEA/raw) will appear here...");
+            ui_style_input(s_bt_dump_panel);
+            lv_obj_set_style_text_font(s_bt_dump_panel, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(s_bt_dump_panel, lv_color_hex(UI_COLOR_TEXT), 0);
+            lv_obj_clear_flag(s_bt_dump_panel, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(s_bt_dump_panel, LV_OBJ_FLAG_SCROLLABLE);
+        }
+    }
+#endif
 
     if (objects.gnss_status_label)
     {
