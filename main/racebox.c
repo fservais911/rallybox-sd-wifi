@@ -121,6 +121,7 @@ static bool racebox_ensure_visible_mutex(void);
 static void racebox_start_scan(void);
 static void racebox_copy_adv_name(char* dst, size_t dst_len, const uint8_t* adv_name, uint8_t adv_name_len);
 static void racebox_update_status(bool connected, int16_t rssi, const char* device_name, const char* status_text);
+static void racebox_reset_stack_state(void);
 
 static bool racebox_contains_ignore_case(const char* haystack, const char* needle)
 {
@@ -360,6 +361,25 @@ static bool racebox_name_matches(const uint8_t* adv_name, uint8_t adv_name_len)
 static void racebox_update_status(bool connected, int16_t rssi, const char* device_name, const char* status_text)
 {
   system_monitor_set_racebox_status(s_racebox_initialized, connected, rssi, device_name, status_text);
+}
+
+static void racebox_reset_stack_state(void)
+{
+  s_racebox_initialized = false;
+  s_racebox_connecting = false;
+  s_racebox_connected = false;
+  s_scan_active = false;
+  s_gattc_if = ESP_GATT_IF_NONE;
+  s_conn_id = 0xFFFF;
+  memset(s_peer_bda, 0, sizeof(s_peer_bda));
+  s_peer_addr_type = BLE_ADDR_TYPE_PUBLIC;
+  s_last_rssi = 0;
+  s_device_name[0] = '\0';
+  s_service_start_handle = 0;
+  s_service_end_handle = 0;
+  s_notify_char_count = 0;
+  memset(s_notify_char_handles, 0, sizeof(s_notify_char_handles));
+  racebox_clear_visible_devices();
 }
 
 static void racebox_record_notify_char(uint16_t handle)
@@ -714,9 +734,16 @@ static void racebox_start_scan(void)
 
 esp_err_t racebox_request_scan(void)
 {
-  if (!s_racebox_initialized || s_gattc_if == ESP_GATT_IF_NONE)
+  if (!s_racebox_initialized)
   {
     return ESP_ERR_INVALID_STATE;
+  }
+
+  if (s_gattc_if == ESP_GATT_IF_NONE)
+  {
+    ESP_LOGW(TAG, "Scan requested before GATTC registration completes; deferring");
+    racebox_update_status(false, 0, s_device_name, "BLE stack is initializing, please wait...");
+    return ESP_OK;
   }
 
   if (s_racebox_connected || s_racebox_connecting)
@@ -751,6 +778,91 @@ esp_err_t racebox_disconnect(void)
 
   racebox_update_status(false, s_last_rssi, s_device_name, "Disconnecting from RaceBox...");
   return esp_ble_gattc_close(s_gattc_if, s_conn_id);
+}
+
+esp_err_t racebox_shutdown(uint32_t timeout_ms)
+{
+  esp_err_t ret;
+  TickType_t deadline;
+
+  if (!s_racebox_initialized)
+  {
+    return ESP_OK;
+  }
+
+  racebox_update_status(false, s_last_rssi, s_device_name, "Stopping RaceBox BLE...");
+
+  if (s_scan_active)
+  {
+    ret = esp_ble_gap_stop_scanning();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+    {
+      ESP_LOGE(TAG, "Failed to stop BLE scan: %s", esp_err_to_name(ret));
+      return ret;
+    }
+  }
+
+  if (s_racebox_connected && s_gattc_if != ESP_GATT_IF_NONE && s_conn_id != 0xFFFF)
+  {
+    ret = esp_ble_gattc_close(s_gattc_if, s_conn_id);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+    {
+      ESP_LOGE(TAG, "Failed to close RaceBox GATT connection: %s", esp_err_to_name(ret));
+      return ret;
+    }
+  }
+
+  deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+  while ((s_scan_active || s_racebox_connected || s_racebox_connecting) &&
+    (TickType_t)(deadline - xTaskGetTickCount()) > 0)
+  {
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+
+  if (s_scan_active || s_racebox_connected || s_racebox_connecting)
+  {
+    ESP_LOGE(TAG, "Timed out waiting for RaceBox BLE activity to stop");
+    return ESP_ERR_TIMEOUT;
+  }
+
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED)
+  {
+    ret = esp_bluedroid_disable();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+    {
+      ESP_LOGE(TAG, "Failed to disable Bluedroid: %s", esp_err_to_name(ret));
+      return ret;
+    }
+  }
+
+  if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_UNINITIALIZED)
+  {
+    ret = esp_bluedroid_deinit();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+    {
+      ESP_LOGE(TAG, "Failed to deinit Bluedroid: %s", esp_err_to_name(ret));
+      return ret;
+    }
+  }
+
+  ret = esp_hosted_bt_controller_disable();
+  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+  {
+    ESP_LOGE(TAG, "Failed to disable BT controller: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  ret = esp_hosted_bt_controller_deinit(false);
+  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+  {
+    ESP_LOGE(TAG, "Failed to deinit BT controller: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  racebox_reset_stack_state();
+  racebox_update_status(false, 0, "", "RaceBox BLE stopped");
+  ESP_LOGI(TAG, "RaceBox BLE stopped successfully");
+  return ESP_OK;
 }
 
 void racebox_set_rx_callback(racebox_rx_callback_t cb, void* user_ctx)

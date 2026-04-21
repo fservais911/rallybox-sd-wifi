@@ -21,6 +21,7 @@ size_t racebox_get_visible_devices(racebox_visible_device_t* out_devices, size_t
 esp_err_t racebox_connect_visible_device(size_t index);
 esp_err_t racebox_request_scan(void);
 esp_err_t racebox_disconnect(void);
+esp_err_t racebox_shutdown(uint32_t timeout_ms);
 void racebox_set_rx_callback(racebox_rx_callback_t cb, void* user_ctx);
 
 #endif // RACEBOX_H

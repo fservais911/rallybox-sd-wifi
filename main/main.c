@@ -61,8 +61,10 @@
 #include "lwip/err.h"                         ///< LWIP TCP/IP error codes
 #include "lwip/sys.h"                         ///< LWIP system definitions
 #include "esp_sntp.h"                         ///< SNTP time synchronization
+#include "esp_hosted_transport_config.h"     ///< ESP-Hosted SDIO transport tuning
 #include <time.h>                             ///< C standard time library
 #include "driver/gpio.h"                      ///< GPIO driver
+#include "debug_flags.h"
 #define EXAMPLE_ESP_MAXIMUM_RETRY  CONFIG_RALLYBOX_WIFI_MAXIMUM_RETRY  ///< Maximum WiFi connection retry attempts
 
  /// WiFi Security Configuration (WPA3-PSK with H2E)
@@ -83,6 +85,39 @@ int s_retry_num = 0;
 
 /// Log tag for this module (used by ESP_LOGI, ESP_LOGW, etc.)
 static const char* TAG = "app_main";
+
+static void configure_hosted_sdio_transport(void)
+{
+    struct esp_hosted_sdio_config sdio_config;
+    esp_hosted_transport_err_t result;
+
+    if (esp_hosted_transport_is_config_valid())
+    {
+        ESP_LOGI(TAG, "ESP-Hosted transport config already set; keeping existing SDIO settings");
+        return;
+    }
+
+    sdio_config = INIT_DEFAULT_HOST_SDIO_CONFIG();
+    sdio_config.clock_freq_khz = 25000;
+    sdio_config.bus_width = 4;
+    sdio_config.tx_queue_size = 64;
+    sdio_config.rx_queue_size = 64;
+
+    result = esp_hosted_sdio_set_config(&sdio_config);
+    if (result == ESP_TRANSPORT_OK)
+    {
+        ESP_LOGI(TAG,
+            "Configured ESP-Hosted SDIO transport: %lu kHz, %u-bit, TX queue=%u, RX queue=%u",
+            (unsigned long)sdio_config.clock_freq_khz,
+            (unsigned)sdio_config.bus_width,
+            (unsigned)sdio_config.tx_queue_size,
+            (unsigned)sdio_config.rx_queue_size);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Unable to override ESP-Hosted SDIO transport config: %d", (int)result);
+    }
+}
 
 /* ═════════════════════════════════════════════════════════════════════════
  * EXTERNAL UI UPDATE FUNCTION PROTOTYPES
@@ -127,7 +162,7 @@ static void touch_debug_callback(lv_event_t* e)
         lv_indev_t* indev = lv_indev_get_act();
         lv_point_t point;
         lv_indev_get_point(indev, &point);
-        ESP_LOGI(TAG, "Touch pressed at: x=%d, y=%d", point.x, point.y);
+        TOUCH_DEBUG_LOGI(TAG, "Touch pressed at: x=%d, y=%d", point.x, point.y);
     }
 }
 
@@ -192,6 +227,9 @@ static void system_monitor_task(void* pvParameters)
         ESP_LOGI(TAG, "Both SD cards mounted successfully.");
     }
 
+    bool sd1_auto_control_enabled = (sd1_ok != 0);
+    bool sd2_auto_control_enabled = (sd2_ok != 0);
+
     /* ── WiFi ────────────────────────────────────────────────────────────── */
     /* WiFi initialization moved to app_main to avoid race with UI callbacks */
     // system_wifi_init(); // was here; initialized from app_main
@@ -221,6 +259,8 @@ static void system_monitor_task(void* pvParameters)
     const TickType_t xFrequency = pdMS_TO_TICKS(250);
     uint8_t slow_tick_divider = 0;
     uint32_t gpio_read_count = 0;
+    int prev_gpio45_level = gpio_get_level(SD1_CONTROL_PIN);
+    int prev_gpio29_level = gpio_get_level(SD2_CONTROL_PIN);
 
     while (1)
     {
@@ -230,21 +270,18 @@ static void system_monitor_task(void* pvParameters)
         int gpio45_level = gpio_get_level(SD1_CONTROL_PIN);
         int gpio29_level = gpio_get_level(SD2_CONTROL_PIN);
 
-        static int prev_gpio45_level = -1;
-        static int prev_gpio29_level = -1;
-
         gpio_read_count++;
 
         // Log GPIO states every 10 cycles (every 2.5 seconds) for diagnostics
         if (gpio_read_count % 10 == 0)
         {
-            ESP_LOGI(TAG, "GPIO states - SD1(GPIO45)=%d, SD2(GPIO29)=%d", gpio45_level, gpio29_level);
+            GPIO_SD_DEBUG_LOGI(TAG, "GPIO states - SD1(GPIO45)=%d, SD2(GPIO29)=%d", gpio45_level, gpio29_level);
         }
 
         // Handle SD Card 1 control (GPIO45)
-        if (gpio45_level != prev_gpio45_level)
+        if (sd1_auto_control_enabled && gpio45_level != prev_gpio45_level)
         {
-            ESP_LOGI(TAG, "*** GPIO45 CHANGED: %d -> %d (LOW=mount SD1, HIGH=unmount SD1) ***", prev_gpio45_level, gpio45_level);
+            GPIO_SD_DEBUG_LOGI(TAG, "*** GPIO45 CHANGED: %d -> %d (LOW=mount SD1, HIGH=unmount SD1) ***", prev_gpio45_level, gpio45_level);
 
             if (bsp_display_lock((uint32_t)-1) == ESP_OK)
             {
@@ -299,11 +336,15 @@ static void system_monitor_task(void* pvParameters)
             prev_gpio45_level = gpio45_level;
             vTaskDelay(pdMS_TO_TICKS(100)); // Debounce delay
         }
+        else if (!sd1_auto_control_enabled)
+        {
+            prev_gpio45_level = gpio45_level;
+        }
 
         // Handle SD Card 2 control (GPIO29)
-        if (gpio29_level != prev_gpio29_level)
+        if (sd2_auto_control_enabled && gpio29_level != prev_gpio29_level)
         {
-            ESP_LOGI(TAG, "*** GPIO29 CHANGED: %d -> %d (LOW=mount SD2, HIGH=unmount SD2) ***", prev_gpio29_level, gpio29_level);
+            GPIO_SD_DEBUG_LOGI(TAG, "*** GPIO29 CHANGED: %d -> %d (LOW=mount SD2, HIGH=unmount SD2) ***", prev_gpio29_level, gpio29_level);
 
             if (bsp_display_lock((uint32_t)-1) == ESP_OK)
             {
@@ -357,6 +398,10 @@ static void system_monitor_task(void* pvParameters)
 
             prev_gpio29_level = gpio29_level;
             vTaskDelay(pdMS_TO_TICKS(100)); // Debounce delay
+        }
+        else if (!sd2_auto_control_enabled)
+        {
+            prev_gpio29_level = gpio29_level;
         }
 
         slow_tick_divider++;
@@ -447,13 +492,30 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
+        wifi_event_sta_disconnected_t* disconnect_event = (wifi_event_sta_disconnected_t*)event_data;
         system_status_t status = system_monitor_get_status();
-        system_monitor_set_wifi_connected(false);
-        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY && status.wifi_state == SYSTEM_WIFI_STATE_CONNECTING)
+        bool should_retry = (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) &&
+            (status.wifi_state == SYSTEM_WIFI_STATE_CONNECTING ||
+                status.wifi_state == SYSTEM_WIFI_STATE_CONNECTED);
+
+        ESP_LOGW(TAG,
+            "WiFi disconnected: reason=%u state=%u retry=%d/%d",
+            disconnect_event ? (unsigned)disconnect_event->reason : 0U,
+            (unsigned)status.wifi_state,
+            s_retry_num,
+            EXAMPLE_ESP_MAXIMUM_RETRY);
+
+        system_monitor_note_wifi_disconnect(
+            disconnect_event ? disconnect_event->reason : 0U,
+            should_retry,
+            should_retry ? (uint32_t)(s_retry_num + 1) : (uint32_t)s_retry_num);
+
+        if (should_retry)
         {
+            system_monitor_set_wifi_state(SYSTEM_WIFI_STATE_CONNECTING);
             esp_wifi_connect();
             s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
+            ESP_LOGI(TAG, "retry to connect to the AP (%d/%d)", s_retry_num, EXAMPLE_ESP_MAXIMUM_RETRY);
         }
         else
         {
@@ -585,7 +647,7 @@ static void time_print_task(void* pv)
         }
 
         strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
-        ESP_LOGI(TAG, "Current IST time: %s", strftime_buf);
+        IST_TIME_DEBUG_LOGI(TAG, "Current IST time: %s", strftime_buf);
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 }
@@ -759,6 +821,7 @@ void app_main(void)
 
     // Initialize system monitoring
     system_monitor_init();
+    configure_hosted_sdio_transport();
     system_wifi_init(); // The stub
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
@@ -817,21 +880,21 @@ void app_main(void)
     };
     gpio_config(&sd2_control_conf);
 
-    ESP_LOGI(TAG, "SD Card control pins configured:");
-    ESP_LOGI(TAG, "  GPIO%d (SD Card 1): LOW=mount, HIGH=unmount", SD1_CONTROL_PIN);
-    ESP_LOGI(TAG, "  GPIO%d (SD Card 2): LOW=mount, HIGH=unmount", SD2_CONTROL_PIN);
+    GPIO_SD_DEBUG_LOGI(TAG, "SD Card control pins configured:");
+    GPIO_SD_DEBUG_LOGI(TAG, "  GPIO%d (SD Card 1): LOW=mount, HIGH=unmount", SD1_CONTROL_PIN);
+    GPIO_SD_DEBUG_LOGI(TAG, "  GPIO%d (SD Card 2): LOW=mount, HIGH=unmount", SD2_CONTROL_PIN);
 
     // Diagnostic: Read GPIO states immediately to verify they're accessible
     int initial_gpio45 = gpio_get_level(SD1_CONTROL_PIN);
     int initial_gpio29 = gpio_get_level(SD2_CONTROL_PIN);
-    ESP_LOGI(TAG, "GPIO initial states after config: GPIO45=%d, GPIO29=%d", initial_gpio45, initial_gpio29);
+    GPIO_SD_DEBUG_LOGI(TAG, "GPIO initial states after config: GPIO45=%d, GPIO29=%d", initial_gpio45, initial_gpio29);
     if (initial_gpio45 == 0 && initial_gpio29 == 0)
     {
-        ESP_LOGI(TAG, "✓ Both GPIO45 and GPIO29 are LOW (default mount state) - cards ready for independent control");
+        GPIO_SD_DEBUG_LOGI(TAG, "Both GPIO45 and GPIO29 are LOW (default mount state) - cards ready for independent control");
     }
     else
     {
-        ESP_LOGW(TAG, "⚠ GPIO states: GPIO45=%d, GPIO29=%d - verify your control circuit connections", initial_gpio45, initial_gpio29);
+        GPIO_SD_DEBUG_LOGW(TAG, "GPIO states: GPIO45=%d, GPIO29=%d - verify your control circuit connections", initial_gpio45, initial_gpio29);
     }
 
     // Create system monitor background task (core 1, priority 5)

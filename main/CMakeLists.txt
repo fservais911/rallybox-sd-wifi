@@ -6,6 +6,7 @@ set(MAIN_SRCS
     system_monitor.c
     display_brightness.c
     sd_card.c
+    GPS_points.c
     ui_logic.c
 )
 
@@ -21,6 +22,10 @@ set(MAIN_REQUIRES
     esp_wifi
     esp_event
     esp_netif
+    esp_http_client
+    esp_https_ota
+    app_update
+    mbedtls
 )
 
 if(CONFIG_RALLYBOX_RACEBOX_ENABLED)

@@ -1,6 +1,6 @@
-# Rallybox ESP32-P4 Firmware
+# RallyBox-Dashboard ESP32-P4 Firmware
 
-**Project Name**: Rallybox
+**Project Name**: RallyBox-Dashboard
 **Developer**: Akhil
 **Company/Author**: Rallybox
 
@@ -27,7 +27,7 @@ A production-grade rally computer firmware for the ESP32-P4 microcontroller, fea
 
 ### Project Purpose
 
-Rallybox is a sophisticated embedded system designed for rally sports telemetry and real-time vehicle diagnostics. It runs on the **ESP32-P4** SoC (System-on-Chip from Espressif) paired with a 720×1280 IPS LCD display featuring capacitive touch input and MIPI DSI interface.
+RallyBox-Dashboard is a sophisticated embedded system designed for rally sports telemetry and real-time vehicle diagnostics. It runs on the **ESP32-P4** SoC (System-on-Chip from Espressif) paired with a 720×1280 IPS LCD display featuring capacitive touch input and MIPI DSI interface.
 
 ### Key Achievements
 
@@ -670,6 +670,30 @@ For bug reports, feature requests, or technical support:
 ---
 
 **Last Updated**: April 6, 2026  
-**Firmware Version**: POC v1.0  
+**Firmware Version**: See the root VERSION file  
 **ESP-IDF Target**: v6.x (Stable)  
 **Board**: Waveshare ESP32-P4-WIFI6-Touch-LCD-X
+
+## Firmware Versioning
+
+The project firmware version now comes from the root [VERSION](VERSION) file.
+
+For OTA and normal builds, increment that single file before building. Example:
+
+```text
+0.1.0
+```
+
+That value is passed into `PROJECT_VER`, embedded into the ESP-IDF app description, and shown in the Settings tab on-device.
+
+## OTA Firmware Flow
+
+The Settings tab now includes an `Update OTA` button. The device downloads the latest public firmware image from the configured S3 bucket under `firmware/RallyBox-Dashboard/RallyBox-Dashboard.bin` and reboots automatically after a successful install.
+
+For publishing:
+
+- Build the firmware so `build/RallyBox-Dashboard.bin` exists.
+- Run the VS Code task `Firmware: Upload OTA Image To S3`.
+- The upload script publishes `firmware/RallyBox-Dashboard/RallyBox-Dashboard.bin`, a versioned backup such as `firmware/RallyBox-Dashboard/RallyBox-Dashboard-0.1.0.bin`, and a manifest JSON at `firmware/RallyBox-Dashboard/ota-manifest.json`.
+
+The OTA download URL defaults to the GPX S3 bucket/region if no dedicated OTA bucket override is configured in `menuconfig -> RallyBox -> Firmware OTA`.
