@@ -134,6 +134,23 @@ static esp_err_t sdmmc_host_shared_deinit(void)
     return ESP_OK;
 }
 
+static esp_err_t sd1_ldo_create(sd_pwr_ctrl_ldo_config_t* ldo_cfg)
+{
+    esp_err_t ret;
+    esp_log_level_t ldo_prev_level;
+
+    if (ldo_cfg == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ldo_prev_level = esp_log_level_get("ldo");
+    esp_log_level_set("ldo", ESP_LOG_ERROR);
+    ret = sd_pwr_ctrl_new_on_chip_ldo(ldo_cfg, &s_card1_pwr);
+    esp_log_level_set("ldo", ldo_prev_level);
+    return ret;
+}
+
 /**
  * @brief Initialize SD Card 1 (SDMMC 4-wire internal slot)
  *
@@ -167,16 +184,15 @@ esp_err_t sd_card1_init(void)
     }
 
     esp_err_t ret;
+    bool shared_host_hw = false;
 
     /* Step 1: Power the slot via on-chip LDO */
     sd_pwr_ctrl_ldo_config_t ldo_cfg = {
         .ldo_chan_id = SD1_LDO_CHAN,
     };
-    esp_log_level_t ldo_prev_level = esp_log_level_get("ldo");
-    esp_log_level_set("ldo", ESP_LOG_ERROR);
-    ret = sd_pwr_ctrl_new_on_chip_ldo(&ldo_cfg, &s_card1_pwr);
-    esp_log_level_set("ldo", ldo_prev_level);
+    ret = sd1_ldo_create(&ldo_cfg);
     ESP_RETURN_ON_ERROR(ret, TAG, "SD1 LDO init failed");
+    vTaskDelay(pdMS_TO_TICKS(120));
 
     /* Step 2: Configure SDMMC host */
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
@@ -188,9 +204,12 @@ esp_err_t sd_card1_init(void)
     sdmmc_host_state_t state = { 0 };
     if (sdmmc_host_get_state(&state) == ESP_OK && state.host_initialized)
     {
+        shared_host_hw = true;
         ESP_LOGI(TAG, "SDMMC Host hardware is shared with ESP-Hosted. Establishing real physical slot connection but bypassing redundant host allocation.");
         host.init = &sdmmc_host_shared_init;
         host.deinit = &sdmmc_host_shared_deinit;
+        /* Give shared SDIO transport time to settle before SD1 init on warm boots. */
+        vTaskDelay(pdMS_TO_TICKS(220));
     }
 
     /* Step 3: Configure slot — explicit GPIO + internal pull-ups */
@@ -214,7 +233,7 @@ esp_err_t sd_card1_init(void)
         .allocation_unit_size = 16 * 1024,
     };
 
-    const int mount_retries = 3;
+    const int mount_retries = 4;
     for (int attempt = 1; attempt <= mount_retries; ++attempt)
     {
         if (attempt > 1)
@@ -235,6 +254,27 @@ esp_err_t sd_card1_init(void)
         {
             ESP_LOGW(TAG, "SD Card 1 mount timeout on attempt %d/%d; retrying",
                 attempt, mount_retries);
+
+            if (shared_host_hw)
+            {
+                ESP_LOGW(TAG, "SD1 shared-host recovery: power-cycling SD1 LDO before retry");
+                if (s_card1_pwr != NULL)
+                {
+                    sd_pwr_ctrl_del_on_chip_ldo(s_card1_pwr);
+                    s_card1_pwr = NULL;
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(280));
+                ret = sd1_ldo_create(&ldo_cfg);
+                if (ret != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "SD1 LDO recover init failed (%s)", esp_err_to_name(ret));
+                    return ret;
+                }
+                host.pwr_ctrl_handle = s_card1_pwr;
+                vTaskDelay(pdMS_TO_TICKS(220));
+            }
+
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }

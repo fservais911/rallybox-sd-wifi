@@ -344,6 +344,45 @@ void system_monitor_set_wifi_ip(const char* ip_str)
     }
 }
 
+void system_monitor_note_wifi_disconnect(uint8_t reason, bool retrying, uint32_t retry_count)
+{
+    if (!ensure_status_mutex())
+    {
+        return;
+    }
+
+    if (xSemaphoreTake(status_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        system_status.wifi_connected = 0;
+        system_status.wifi_rssi = 0;
+        system_status.wifi_retry_count = retry_count;
+        system_status.wifi_disconnect_count++;
+        system_status.wifi_state = retrying ? SYSTEM_WIFI_STATE_CONNECTING : SYSTEM_WIFI_STATE_DISCONNECTED;
+        wifi_set_ip_string("0.0.0.0");
+
+        if (retrying)
+        {
+            snprintf(system_status.wifi_last_error,
+                sizeof(system_status.wifi_last_error),
+                "WiFi dropped, retrying (%u)",
+                (unsigned)reason);
+        }
+        else
+        {
+            snprintf(system_status.wifi_last_error,
+                sizeof(system_status.wifi_last_error),
+                "WiFi disconnected (%u)",
+                (unsigned)reason);
+        }
+
+        xSemaphoreGive(status_mutex);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Failed to acquire status mutex for disconnect update");
+    }
+}
+
 void system_monitor_set_racebox_status(bool initialized, bool connected, int16_t rssi,
     const char* device_name, const char* status_text)
 {
@@ -504,6 +543,9 @@ extern int s_retry_num;
  */
 esp_err_t system_wifi_connect_credentials(const char* ssid, const char* password)
 {
+    system_status_t status_snapshot;
+    esp_err_t err;
+
     if (!ssid || ssid[0] == '\0') return ESP_ERR_INVALID_ARG;
 
     // Save to NVS
@@ -530,17 +572,65 @@ esp_err_t system_wifi_connect_credentials(const char* ssid, const char* password
     cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
     cfg.sta.sae_h2e_identifier[0] = '\0';
 
-    // Update local status struct so UI knows right away
-    snprintf(system_status.wifi_ssid, sizeof(system_status.wifi_ssid), "%s", ssid);
+    if (!ensure_status_mutex())
+    {
+        return ESP_FAIL;
+    }
 
-    // IMPORTANT: Set state BEFORE calling esp_wifi_disconnect to prevent event handler race condition
+    if (xSemaphoreTake(status_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        snprintf(system_status.wifi_ssid, sizeof(system_status.wifi_ssid), "%s", ssid);
+        wifi_set_ip_string("0.0.0.0");
+        wifi_set_last_error("Connecting...");
+        system_status.wifi_connected = 0;
+        system_status.wifi_retry_count = 0;
+        system_status.wifi_state = SYSTEM_WIFI_STATE_CONNECTING;
+        system_status.wifi_connect_attempts++;
+        xSemaphoreGive(status_mutex);
+    }
+
     s_retry_num = 0;
-    system_status.wifi_state = SYSTEM_WIFI_STATE_CONNECTING;
-    system_status.wifi_connect_attempts++;
+    status_snapshot = system_monitor_get_status();
 
-    esp_wifi_disconnect();
-    esp_wifi_set_config(WIFI_IF_STA, &cfg);
-    esp_wifi_connect();
+    err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (err != ESP_OK)
+    {
+        if (xSemaphoreTake(status_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            system_status.wifi_state = SYSTEM_WIFI_STATE_DISCONNECTED;
+            wifi_set_last_error("Failed to apply WiFi config");
+            xSemaphoreGive(status_mutex);
+        }
+        return err;
+    }
+
+    if (status_snapshot.wifi_state == SYSTEM_WIFI_STATE_CONNECTED ||
+        status_snapshot.wifi_state == SYSTEM_WIFI_STATE_CONNECTING)
+    {
+        err = esp_wifi_disconnect();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_CONNECT)
+        {
+            if (xSemaphoreTake(status_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                system_status.wifi_state = SYSTEM_WIFI_STATE_DISCONNECTED;
+                wifi_set_last_error("Failed to restart WiFi connection");
+                xSemaphoreGive(status_mutex);
+            }
+            return err;
+        }
+    }
+
+    err = esp_wifi_connect();
+    if (err != ESP_OK)
+    {
+        if (xSemaphoreTake(status_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            system_status.wifi_state = SYSTEM_WIFI_STATE_DISCONNECTED;
+            wifi_set_last_error("Failed to start WiFi connection");
+            xSemaphoreGive(status_mutex);
+        }
+        return err;
+    }
 
     return ESP_OK;
 }

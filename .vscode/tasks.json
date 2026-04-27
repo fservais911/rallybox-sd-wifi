@@ -42,6 +42,20 @@
       ],
       "problemMatcher": [],
       "group": "build"
+    },
+    {
+      "label": "Firmware: Upload OTA Image To S3",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\.vscode\\scripts\\upload_ota_firmware_s3.ps1"
+      ],
+      "problemMatcher": [],
+      "group": "build"
     }
   ]
 }

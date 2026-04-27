@@ -181,6 +181,15 @@ void system_monitor_set_wifi_state(system_wifi_state_t state);
 void system_monitor_set_wifi_ip(const char* ip_str);
 
 /**
+ * @brief Record a Wi-Fi disconnect event and update retry state.
+ *
+ * @param reason ESP-IDF disconnect reason code
+ * @param retrying True when the firmware will immediately retry
+ * @param retry_count Current retry attempt count
+ */
+void system_monitor_note_wifi_disconnect(uint8_t reason, bool retrying, uint32_t retry_count);
+
+/**
  * @brief Update RaceBox BLE connection status (thread-safe)
  */
 void system_monitor_set_racebox_status(bool initialized, bool connected, int16_t rssi,
