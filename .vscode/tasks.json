@@ -2,7 +2,7 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Git: Create Snapshot Commit (main)",
+      "label": "Desktop: Git: Create Snapshot Commit (main)",
       "type": "process",
       "command": "powershell.exe",
       "args": [
@@ -16,7 +16,7 @@
       "group": "build"
     },
     {
-      "label": "Git: Create Backup Branch From Main",
+      "label": "Desktop: Git: Create Backup Branch From Main",
       "type": "process",
       "command": "powershell.exe",
       "args": [
@@ -30,7 +30,7 @@
       "group": "build"
     },
     {
-      "label": "Git: Restore Last Backup To Main",
+      "label": "Desktop: Git: Restore Last Backup To Main",
       "type": "process",
       "command": "powershell.exe",
       "args": [
@@ -44,7 +44,7 @@
       "group": "build"
     },
     {
-      "label": "Firmware: Upload OTA Image To S3",
+      "label": "Desktop: Upload OTA Image To S3",
       "type": "process",
       "command": "powershell.exe",
       "args": [
